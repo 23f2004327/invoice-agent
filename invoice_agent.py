@@ -311,3 +311,5 @@ async def cancel(tid: str, request: Request):
         return ok(t)
 from mailroom_agent import router as _mr
 app.include_router(_mr)
+from incident_agent import router as _ir
+app.include_router(_ir)
