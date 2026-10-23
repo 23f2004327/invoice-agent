@@ -19,6 +19,7 @@ dbl = threading.Lock()
 with dbl:
     db.executescript("""
     CREATE TABLE IF NOT EXISTS inc(runid TEXT PRIMARY KEY, req_hash TEXT, state TEXT, first TEXT);
+    CREATE TABLE IF NOT EXISTS inc_dbg(ts REAL, j TEXT);
     CREATE TABLE IF NOT EXISTS inc_rc(runid TEXT, rid TEXT, h TEXT, resp TEXT, PRIMARY KEY(runid, rid));""")
 
 def q(sql, a=(), one=False):
@@ -313,6 +314,10 @@ def secrets_of(b):
 # ---------------- routes ----------------
 inflight = {}
 
+@router.get("/v2/_last")
+async def last_runs():
+    return [json.loads(r[0]) for r in q("SELECT j FROM inc_dbg ORDER BY ts DESC LIMIT 2")]
+
 @router.get("/v2/_selftest")
 async def selftest():
     """Tiny model call to show whether the planner's LLM settings work (no secrets returned)."""
@@ -331,7 +336,7 @@ async def selftest():
 async def build_run(b, h, t_req, tp_h, ts_h):
     run = b["runId"]
     inc, pol = b["incident"], b["policy"]
-    ids = list(dict.fromkeys(re.findall(r"^\s*\[([^\]\s]+)\]", inc["transcript"], re.M)))
+    ids = list(dict.fromkeys(re.split(r"[\s|,;]+", x.strip())[0] for x in re.findall(r"^\s*[-*>]?\s*\[([^\]]+)\]", inc["transcript"], re.M) if x.strip()))
     prompt = json.dumps({"incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
                          "toolCatalog": b["toolCatalog"],
                          "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}},
@@ -358,6 +363,17 @@ async def build_run(b, h, t_req, tp_h, ts_h):
         disp.append(dispatch(state, c))
     first = waiting(state, disp, [])
     save_state(state, h, first)
+    try:
+        dbg = {"requestKeys": sorted(b), "incidentKeys": sorted(inc), "policyKeys": sorted(pol),
+               "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
+               "allowedRootCauses": inc.get("allowedRootCauses"),
+               "toolCatalog": [{"name": t.get("name"), "schema": t.get("inputSchema")} for t in b["toolCatalog"] if isinstance(t, dict)],
+               "transcriptHead": inc["transcript"][:700], "transcriptLen": len(inc["transcript"]), "idsFound": len(ids),
+               "idsSample": ids[:6], "llmError": LAST.get("err"), "rawPlan": rawplan,
+               "response": {"diagnosis": first["diagnosis"], "dispatches": [{k: d[k] for k in ("toolName", "arguments", "evidence")} for d in disp]}}
+        q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps(dbg)))
+    except Exception:
+        pass
     return first
 
 @router.post("/v2/incidents")
