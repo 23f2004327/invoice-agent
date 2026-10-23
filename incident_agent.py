@@ -68,12 +68,12 @@ async def call_llm(prompt, deadline):
     last = None
     for _ in range(2):
         left = deadline - time.time()
-        if left < 3.5:
+        if left < 4.5:
             break
         body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"}, "max_tokens": 1200,
                 "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": prompt}]}
         try:
-            async with httpx.AsyncClient(timeout=min(left - 1, 13)) as c:
+            async with httpx.AsyncClient(timeout=min(left - 0.5, 11.5)) as c:
                 r = await c.post(f"{LLM_URL}/chat/completions", json=body, headers={"Authorization": f"Bearer {LLM_KEY}"})
                 r.raise_for_status()
                 txt = r.json()["choices"][0]["message"]["content"]
@@ -286,8 +286,8 @@ def validate_create(b):
         assert isinstance(b.get("runId"), str) and len(b["runId"]) >= 1
         i = b["incident"]
         assert isinstance(i["transcript"], str) and isinstance(i["allowedRootCauses"], list) and i["allowedRootCauses"]
-        assert isinstance(b["toolCatalog"], list) and isinstance(b["policy"], dict)
-        assert isinstance(b.get("publicMarker"), str)
+        assert isinstance(b.get("toolCatalog", []), list) and isinstance(b.get("policy", {}), dict)
+        b.setdefault("toolCatalog", []); b.setdefault("policy", {})
     except Exception:
         raise Bad(400)
 
@@ -307,6 +307,40 @@ def secrets_of(b):
     return out
 
 # ---------------- routes ----------------
+inflight = {}
+
+async def build_run(b, h, t_req, tp_h, ts_h):
+    run = b["runId"]
+    inc, pol = b["incident"], b["policy"]
+    ids = list(dict.fromkeys(re.findall(r"^\s*\[([^\]\s]+)\]", inc["transcript"], re.M)))
+    prompt = json.dumps({"incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
+                         "toolCatalog": b["toolCatalog"],
+                         "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}},
+                        ensure_ascii=False) + "\n\nTRANSCRIPT:\n" + inc["transcript"]
+    m0 = ns()
+    rawplan = await call_llm(prompt, t_req + 14.0)
+    if not isinstance(rawplan, dict):
+        rawplan = {}
+    m1 = ns()
+    plan = make_plan(rawplan, b, set(ids))
+    tr_in = parse_tp(tp_h or b.get("traceparent"))
+    trace = {"traceId": tr_in[0] if tr_in else hexid(16), "parent": tr_in[1] if tr_in else None,
+             "tracestate": (ts_h or b.get("tracestate")) if tr_in else None,
+             "server": hexid(8), "agent": hexid(8), "model": hexid(8), "join": hexid(8), "approval": hexid(8)}
+    state = {"runId": run, "marker": str(b.get("publicMarker", "")), "agentName": b.get("agentName") or "incident-response",
+             "trace": trace, "t0": int(t_req * 1e9), "model_start": m0, "model_end": m1,
+             "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]}, "plan": plan,
+             "approvalRequiredFor": pol.get("approvalRequiredFor", []), "phase": "diagnostics",
+             "calls": {}, "actionLog": [], "receiptLog": [], "approval": None, "status": "waiting"}
+    disp = []
+    for i, d in enumerate(plan["diagnostics"]):
+        c = new_call(state, "diagnostic", i, d["toolName"], d["arguments"], d["evidence"])
+        c["toolSpan"] = hexid(8)
+        disp.append(dispatch(state, c))
+    first = waiting(state, disp, [])
+    save_state(state, h, first)
+    return first
+
 @router.post("/v2/incidents")
 async def create(request: Request):
     t_req = time.time()
@@ -321,42 +355,25 @@ async def create(request: Request):
         return err(400)
     run = b["runId"]
     h = sha(canon(b))
+    row = q("SELECT req_hash, first FROM inc WHERE runid=?", (run,), one=True)
+    if row:
+        return err(409, "conflict") if row[0] != h else JSONResponse(json.loads(row[1]))
+    cur = inflight.get(run)
+    if cur and cur[0] != h:
+        return err(409, "conflict")
+    if cur:
+        task = cur[1]
+    else:
+        task = asyncio.create_task(build_run(b, h, t_req, request.headers.get("traceparent"), request.headers.get("tracestate")))
+        inflight[run] = (h, task)
+        task.add_done_callback(lambda _t, r=run: inflight.pop(r, None))
     try:
-        async with lock_for(run):
-            row = q("SELECT req_hash, first FROM inc WHERE runid=?", (run,), one=True)
-            if row:
-                if row[0] != h:
-                    return err(409, "conflict")
-                return JSONResponse(json.loads(row[1]))
-            inc, pol = b["incident"], b["policy"]
-            ids = list(dict.fromkeys(re.findall(r"^\s*\[([^\]\s]+)\]", inc["transcript"], re.M)))
-            prompt = json.dumps({"incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
-                                 "toolCatalog": b["toolCatalog"],
-                                 "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")}},
-                                ensure_ascii=False) + "\n\nTRANSCRIPT:\n" + inc["transcript"]
-            m0 = ns()
-            rawplan = await call_llm(prompt, t_req + 15.5)
-            m1 = ns()
-            plan = make_plan(rawplan, b, set(ids))
-            tr_in = parse_tp(request.headers.get("traceparent") or b.get("traceparent"))
-            trace = {"traceId": tr_in[0] if tr_in else hexid(16), "parent": tr_in[1] if tr_in else None,
-                     "tracestate": (request.headers.get("tracestate") or b.get("tracestate")) if tr_in else None,
-                     "server": hexid(8), "agent": hexid(8), "model": hexid(8), "join": hexid(8), "approval": hexid(8)}
-            state = {"runId": run, "marker": b["publicMarker"], "agentName": b.get("agentName") or "incident-response",
-                     "trace": trace, "t0": int(t_req * 1e9), "model_start": m0, "model_end": m1,
-                     "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]}, "plan": plan,
-                     "approvalRequiredFor": pol.get("approvalRequiredFor", []), "phase": "diagnostics",
-                     "calls": {}, "actionLog": [], "receiptLog": [], "approval": None, "status": "waiting"}
-            disp = []
-            for i, d in enumerate(plan["diagnostics"]):
-                c = new_call(state, "diagnostic", i, d["toolName"], d["arguments"], d["evidence"])
-                c["toolSpan"] = hexid(8)
-                disp.append(dispatch(state, c))
-            first = waiting(state, disp, [])
-            save_state(state, h, first)
-            return JSONResponse(first)
-    except Bad as e:
-        return err(e.status)
+        first = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return err(500, "internal error")
+    return JSONResponse(first)
 
 def save_state(state, h=None, first=None):
     for c in state["calls"].values():
