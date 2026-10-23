@@ -63,9 +63,20 @@ SYS = """You are an incident-response planner. Given an incident transcript (man
 2. evidence: 2-4 distinct evidence IDs (the bracketed IDs at line starts) that actually establish the root cause.
 3. diagnostics: 1..maximumDiagnostics calls (diagnostic tools only, NOT effect tools) needed to CONFIRM the cause. Independent calls are issued together. Do not add unneeded calls. Arguments must be exact incident-specific values from the transcript (service, deployment id, region, flag name, time window...) matching the tool inputSchema. Each cites >=1 of your diagnosis evidence IDs.
 4. effect: exactly one tool from policy.effectTools that is the justified response, with exact arguments (the exact target from the transcript). If the service is ALREADY at its permitted scaling limit, do not scale: choose the tool that pages the owner. Destructive tools (rollback_deployment, disable_feature) only with the exact correct target.
+
+EVIDENCE SELECTION: the transcript has 100+ lines and most are distractors: older postmortems, capacity forecasts and hypotheticals, synthetic probes, other services or correlation IDs, quoted customer text. Choose lines that are direct OBSERVATIONS from THIS incident (service = incident.service, inside the incident window) and that separate the true cause from the other allowed causes. Pick the 2 (at most 4) most decisive lines; do not cite lines that merely mention keywords.
+SCALING LIMIT: look for lines giving the permitted maximum replicas / scaling limit and the current replica count. If the service is already at its limit, do NOT scale; the effect must be page_owner. Never scale beyond the permitted limit.
+EFFECT ARGUMENTS: rollback_deployment.release = the previous known-good release id from the transcript (not the failing one); scale_service.targetReplicas = integer within the permitted limit; disable_feature.flag = exact flag name from evidence; page_owner/open_incident.severity = the incident severity; no_action.reasonCode = a short code. The service argument is always incident.service.
+DIAGNOSTICS: pick the 1-3 calls that would CONFIRM your root cause, with arguments derived from transcript facts (metric names, log query terms, runbook topic, dependency name, windowMinutes); required inputSchema fields must all be present.
 Return ONLY JSON: {"rootCause":"..","evidence":[".."],"diagnostics":[{"toolName":"..","arguments":{..},"evidence":[".."]}],"effect":{"toolName":"..","arguments":{..},"evidence":[".."]}}"""
 
 LAST = {}
+
+def dbg(kind, **kw):
+    try:
+        q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps({"kind": kind, **kw})))
+    except Exception:
+        pass
 
 async def call_llm(prompt, deadline):
     last = None
@@ -316,7 +327,14 @@ inflight = {}
 
 @router.get("/v2/_last")
 async def last_runs():
-    return [json.loads(r[0]) for r in q("SELECT j FROM inc_dbg ORDER BY ts DESC LIMIT 2")]
+    out = []
+    for r in q("SELECT j FROM inc_dbg ORDER BY ts DESC LIMIT 40"):
+        d = json.loads(r[0])
+        if "transcriptHead" in d:
+            d["transcriptHead"] = d["transcriptHead"][:150]
+            d.pop("toolCatalog", None)
+        out.append(d)
+    return out
 
 @router.get("/v2/_selftest")
 async def selftest():
@@ -422,12 +440,26 @@ def save_state(state, h=None, first=None):
 async def get_run(run: str):
     row = q("SELECT state FROM inc WHERE runid=?", (run,), one=True)
     if not row:
+        dbg("get", run=run, http=404)
         return err(404, "not found")
-    return JSONResponse(json.loads(row[0])["current"])
+    cur = json.loads(row[0])["current"]
+    dbg("get", run=run, http=200, status=cur.get("status"))
+    return JSONResponse(cur)
 
 @router.post("/v2/incidents/{run}/receipts")
 async def receipts(run: str, request: Request):
     raw = await request.body()
+    resp = await receipts_inner(run, request, raw)
+    try:
+        body = json.loads(resp.body)
+        brief = {"status": body.get("status"), "dispatches": [d.get("toolName") + "#" + str(d.get("attempt")) for d in body.get("dispatches", [])],
+                 "approvals": len(body.get("approvals", [])), "error": body.get("error")}
+    except Exception:
+        brief = {}
+    dbg("receipt", run=run, http=resp.status_code, request=raw[:700].decode("utf8", "replace"), resp=brief)
+    return resp
+
+async def receipts_inner(run, request, raw):
     if len(raw) > 1_000_000:
         return err(413)
     try:
@@ -460,7 +492,8 @@ async def receipts(run: str, request: Request):
                     c = state["calls"][o["actionId"]]
                     assert o["actionId"] not in seen and c["state"] == "pending" and o["callId"] == c["callId"]
                     assert o["attempt"] == len(c["attempts"]) and isinstance(o["status"], int)
-                    assert isinstance(o["nonce"], str) and o["nonce"]
+                    o.setdefault("nonce", "")
+                    assert isinstance(o["nonce"], str)
                 except Exception:
                     raise Bad(400)
                 seen.add(o["actionId"])
