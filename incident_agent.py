@@ -325,6 +325,21 @@ def secrets_of(b):
 # ---------------- routes ----------------
 inflight = {}
 
+async def log_mw(request: Request, call_next):
+    t = time.time()
+    try:
+        resp = await call_next(request)
+        st = resp.status_code
+    except Exception as e:
+        dbg("req", method=request.method, path=request.url.path, status=500, error=f"{type(e).__name__}: {str(e)[:200]}")
+        raise
+    p = request.url.path
+    if p.startswith("/v2/") and not p.startswith("/v2/_"):
+        dbg("req", method=request.method, path=p[:60], status=st, ms=int((time.time() - t) * 1000),
+            tp=bool(request.headers.get("traceparent")), ts=bool(request.headers.get("tracestate")),
+            ct=request.headers.get("content-type"), clen=request.headers.get("content-length"))
+    return resp
+
 @router.get("/v2/_last")
 async def last_runs():
     out = []
@@ -354,6 +369,8 @@ async def selftest():
 async def build_run(b, h, t_req, tp_h, ts_h):
     run = b["runId"]
     inc, pol = b["incident"], b["policy"]
+    inc = dict(inc)
+    inc["transcript"] = re.sub(r"\s*Correlation corr_\S+ was checked against \S+; retain this full sentence[^\n]*", "", inc["transcript"])
     ids = list(dict.fromkeys(re.split(r"[\s|,;]+", x.strip())[0] for x in re.findall(r"^\s*[-*>]?\s*\[([^\]]+)\]", inc["transcript"], re.M) if x.strip()))
     prompt = json.dumps({"incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
                          "toolCatalog": b["toolCatalog"],
@@ -388,7 +405,7 @@ async def build_run(b, h, t_req, tp_h, ts_h):
                "toolCatalog": [{"name": t.get("name"), "schema": t.get("inputSchema")} for t in b["toolCatalog"] if isinstance(t, dict)],
                "transcriptHead": inc["transcript"][:700], "transcriptLen": len(inc["transcript"]), "idsFound": len(ids),
                "idsSample": ids[:6], "llmError": LAST.get("err"), "rawPlan": rawplan,
-               "response": {"diagnosis": first["diagnosis"], "dispatches": [{k: d[k] for k in ("toolName", "arguments", "evidence")} for d in disp]}}
+               "modelSeconds": round((m1 - m0) / 1e9, 2), "promptChars": len(prompt), "full": first}
         q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps(dbg)))
     except Exception:
         pass
