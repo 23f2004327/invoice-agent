@@ -242,7 +242,7 @@ def finish(d, body):
 
 ERRS = []
 SEM = asyncio.Semaphore(3)
-CHUNK = 6
+CHUNK = int(os.environ.get("MAILROOM_CHUNK", "10"))
 
 async def llm(chunk):
     prompt = "\n\n".join(render(d, i + 1) for i, d in enumerate(chunk))
@@ -268,7 +268,9 @@ async def llm(chunk):
             ERRS.append(f"{type(e).__name__}: {str(e)[:160]}")
             del ERRS[:-10]
             print("mailroom llm error:", ERRS[-1], flush=True)
-            await asyncio.sleep(1.5 * (attempt + 1))
+            if "Usage $" in ERRS[-1]:  # budget exhausted: retrying is pointless
+                break
+            await asyncio.sleep(4 * (attempt + 1))
     return {}
 
 def cached(d):
