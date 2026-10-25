@@ -407,7 +407,9 @@ async def build_run(b, h, t_req, tp_h, ts_h):
                "allowedRootCauses": inc.get("allowedRootCauses"),
                "toolCatalog": [{"name": t.get("name"), "schema": t.get("inputSchema")} for t in b["toolCatalog"] if isinstance(t, dict)],
                "transcriptHead": inc["transcript"][:700], "transcriptLen": len(inc["transcript"]), "idsFound": len(ids),
-               "idsSample": ids[:6], "llmError": LAST.get("err"), "rawPlan": rawplan,
+               "idsSample": ids[:6],
+               "keyLines": [ln[:230] for ln in inc["transcript"].split("\n") if inc.get("service") and inc["service"] in ln][:30],
+               "svc": inc.get("service"), "sev": inc.get("severity"), "llmError": LAST.get("err"), "rawPlan": rawplan,
                "modelSeconds": round((m1 - m0) / 1e9, 2), "promptChars": len(prompt), "full": first}
         q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps(dbgd)))
     except Exception:
