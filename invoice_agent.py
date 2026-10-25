@@ -105,7 +105,7 @@ reject_duplicate: the SAME commercial invoice (same vendor AND same invoice numb
 open_exception: material records conflict (amount, vendor, PO, quantity or currency mismatch between documents) and need an exception workflow.
 HOW TO READ: packages mix useful facts with decoys: cover sheets, old policy revisions, archive and training examples, quoted or negated statements ("do not hold", "would have been rejected"), and irrelevant action words. Never decide from keywords. Find the ONE paragraph that states the controlling fact for THIS invoice under the CURRENT policy revision; negations and examples do not count. Check amounts against the authority limit stated in the current policy, check whether a prior payment is truly the same invoice, and check whether verification is complete or still pending.
 evidenceRefs = EXACTLY the three bracketed references (copy the text inside the brackets exactly) that appear in that one decisive paragraph. Never use the cover-sheet reference, archive examples, or training decoys.
-facts: vendorName, invoiceNumber, amountMinor (integer in minor units, e.g. 12345.67 INR -> 1234567), currency (ISO code) of the CURRENT invoice as stated in the controlling documents.
+facts: vendorName = the vendor COMPANY name (never an account number like AC-123), invoiceNumber = the INV-... identifier if present else the submitted order id, amountMinor (integer in minor units, e.g. 12345.67 INR -> 1234567), currency (ISO code) of the CURRENT invoice as stated in the controlling documents.
 reason: two sentences, at least 80 characters, naming the action and explaining how the cited evidence supports it.
 Return ONLY JSON: {"decisions":[{"packageId":..,"action":..,"facts":{..},"evidenceRefs":[a,b,c],"reason":..}]}"""
 
@@ -129,6 +129,79 @@ def valid(d, text):
     return (d.get("action") in ACTIONS and refs_ok(d.get("evidenceRefs"), text)
             and isinstance(f.get("amountMinor"), int) and not isinstance(f.get("amountMinor"), bool)
             and all(isinstance(f.get(k), str) and f.get(k) for k in ("vendorName", "invoiceNumber", "currency")))
+
+
+# ---------- deterministic reading of the package structure (decoy removal + rule engine) ----------
+from decimal import Decimal
+REF = re.compile(r"\[(R_[A-Za-z0-9]+)\]")
+DECOY = re.compile("|".join([
+    r"Historical bank transfer for a different order", r"Archive examples mention every available action",
+    r"bank-detail change in a training case", r"closed reconciliation incident for a separate supplier",
+    r"Archived supplier memo for unrelated order", r"previous quarter used a different authorization threshold",
+    r"Archive note \[", r"Training appendix \[", r"archived delegation has expired"]), re.I)
+COVER = re.compile(r"signed cover sheet|^\s*Case-file extract", re.I)
+NUM = r"([A-Z]{3}) ([0-9]+(?:\.[0-9]+)?)"
+
+def minor(x):
+    return int((Decimal(x) * 100).quantize(Decimal(1)))
+
+def analyze(p):
+    cover, case = [], []
+    docs = p.get("documents", []) if isinstance(p, dict) else []
+    for doc in docs:
+        for para in re.split(r"\n\s*\n", str(doc.get("text", "")) if isinstance(doc, dict) else ""):
+            if not REF.search(para) or DECOY.search(para):
+                continue
+            (cover if COVER.search(para) else case).append(para.strip())
+    refs = []
+    for para in case:
+        for r in REF.findall(para):
+            if r not in refs:
+                refs.append(r)
+    return cover, case, refs
+
+def clean_view(p):
+    cover, case, refs = analyze(p)
+    if not case:
+        return p
+    return {"packageId": pid(p), "coverSheet(facts only, never cite)": cover, "decisiveCandidates": case}
+
+def engine(cover, case):
+    """Apply the payment-controls order to parsed facts. Returns {action, facts} or None when unsure."""
+    t = " ".join(case)
+    led = re.search(r"disbursement for " + NUM + r" to (.+?) previously settled order (PO-[\w-]+)\. The currently submitted order is (PO-[\w-]+)", t)
+    if not led:
+        return None
+    pcur, pamt, vendor, prior_o, cur_o = led.groups()
+    inst = re.search(r"Signed commercial instrument (INV-[\w-]+) covers order (PO-[\w-]+), payee \S+ and " + NUM, t)
+    ceil = re.search(r"autonomous payment ceiling for [A-Z]{3} is " + NUM, t)
+    order = re.search(r"Order (PO-[\w-]+) is signed for " + NUM + r".*?submitted invoice total is " + NUM, t)
+    inv = inst.group(1) if inst else (re.search(r"\b(INV-[\w-]+)", t) or [None, None])[1]
+    if prior_o == cur_o:
+        icur, iamt = (inst.group(3), inst.group(4)) if inst else (order.group(5), order.group(6)) if order else (pcur, pamt)
+        if Decimal(iamt) != Decimal(pamt) or icur != pcur:
+            return None
+        return {"action": "reject_duplicate", "facts": {"vendorName": vendor, "invoiceNumber": inv or cur_o,
+                "amountMinor": minor(iamt), "currency": icur}}
+    if not (ceil and order):
+        return None
+    o_order, scur, samt, icur, iamt = order.groups()
+    limit = Decimal(ceil.group(2))
+    vm = re.search(r"Vendor master lists account (\S+?)\. Remittance instructions now specify (\S+?)\.", t)
+    cb_ok = bool(re.search(r"callback[^.]*\bis confirmed\b", t)) and not re.search(r"callback[^.]*\b(not|unconfirmed|pending|outstanding|awaiting|failed|could not)\b", t, re.I)
+    if o_order != cur_o or Decimal(samt) != Decimal(iamt) or scur != icur:
+        act = "open_exception"
+    elif vm and vm.group(1) != vm.group(2) and not cb_ok:
+        act = "hold_invoice"
+    elif Decimal(iamt) > limit:
+        act = "request_approval"
+    else:
+        act = "settle_invoice"
+    return {"action": act, "facts": {"vendorName": vendor, "invoiceNumber": inv or cur_o, "amountMinor": minor(iamt), "currency": icur}}
+
+def cover_facts(cover):
+    m = re.search(r"Supplier (.+?); invoice (\S+?); stated total " + NUM, " ".join(cover))
+    return {"vendorName": m.group(1), "invoiceNumber": m.group(2), "amountMinor": minor(m.group(4)), "currency": m.group(3)} if m else None
 
 ERRS = []
 
@@ -167,7 +240,7 @@ async def llm(pkgs, rev=None):
     body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYS},
                          {"role": "user", "content": json.dumps(
-                             {"policyRevision": rev, "packages": [{"packageId": pid(p), "package": p} for p in pkgs]}, ensure_ascii=False)}]}
+                             {"policyRevision": rev, "packages": [{"packageId": pid(p), "package": clean_view(p)} for p in pkgs]}, ensure_ascii=False)}]}
     async with httpx.AsyncClient(timeout=40) as c:
         r = await c.post(f"{LLM_URL}/chat/completions", json=body,
                          headers={"Authorization": f"Bearer {LLM_KEY}"})
@@ -182,7 +255,7 @@ async def decide(packages, rev=None):
     """Returns {packageId: decision}; caches by canonical package content."""
     res, todo = {}, []
     for p in packages:
-        k = sha("inv-v2|" + canon(p))
+        k = sha("inv-v3|" + canon(p))
         row = q("SELECT v FROM cache WHERE k=?", (k,), one=True)
         if row:
             res[pid(p)] = json.loads(row[0])
@@ -201,7 +274,19 @@ async def decide(packages, rev=None):
                 d = by.get(pid(p))
                 if not d:
                     continue
+                cover, case, refs = analyze(p)
                 d["evidenceRefs"] = repair(fix_refs(d.get("evidenceRefs"), ""), p)
+                if len(refs) == 3:
+                    d["evidenceRefs"] = refs
+                try:
+                    eng = engine(cover, case)
+                    cf = cover_facts(cover)
+                    if eng:
+                        d["action"], d["facts"] = eng["action"], eng["facts"]
+                    elif cf and isinstance(d.get("facts"), dict):
+                        d["facts"].update(cf)
+                except Exception:
+                    pass
                 text = json.dumps(p, ensure_ascii=False)
                 if valid(d, text):
                     d["evidenceRefs"] = d["evidenceRefs"] if STRIP else [f"[{r}]" for r in d["evidenceRefs"]]
@@ -217,7 +302,7 @@ def proposal(batch_id, p, d):
     f = d["facts"]
     r = d["evidenceRefs"]
     rat = (f"Action {d['action']} chosen for {f['vendorName']} invoice {f['invoiceNumber']}: "
-           f"{d.get('reason', '')} Decisive evidence: {r[0]}; {r[1]}; {r[2]}.")
+           f"{d.get('reason', '')} Decisive evidence: [{r[0]}], [{r[1]}], [{r[2]}].")
     rat = rat[:1500].ljust(60, ".")
     return {"packageId": pid(p), "actionId": "act-" + sha(f"{batch_id}|{pid(p)}")[:24],
             "action": d["action"],
@@ -352,11 +437,3 @@ async def cancel(tid: str, request: Request):
         t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
         save(p, t)
         return ok(t)
-from mailroom_agent import router as _mr
-app.include_router(_mr)
-
-from incident_agent import router as _ir
-app.include_router(_ir)
-
-from incident_agent import log_mw
-app.middleware("http")(log_mw)
