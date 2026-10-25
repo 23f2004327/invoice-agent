@@ -3,7 +3,7 @@ Env: BASE_URL (exact submitted URL, e.g. https://host/a2a), BASE_PATH (default /
      LLM_BASE_URL, LLM_API_KEY, LLM_MODEL (any OpenAI-compatible chat endpoint),
      DB_PATH (put on a persistent disk), STRIP_BRACKETS (1 = refs without [ ]).
 """
-import asyncio, hashlib, json, os, re, sqlite3, threading, uuid
+import asyncio, hashlib, json, os, re, sqlite3, threading, time, uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 import httpx
@@ -88,19 +88,25 @@ def card():
                     "tags": ["invoice", "payments", "approval"]}],
     }, media_type="application/json")
 
+@app.get("/debug/invoice")
+def debug_invoice():
+    try:
+        rows = q("SELECT j FROM inv_dbg ORDER BY ts DESC LIMIT 5")
+    except Exception:
+        rows = []
+    return {"llmErrors": ERRS[-5:], "samples": [json.loads(r[0]) for r in rows]}
+
 # ---------- LLM decisions ----------
-SYS = """You are an accounts-payable analyst. For EACH package choose exactly one action:
-settle_invoice: valid, reconciled, within autonomous approval authority.
-request_approval: commercially valid but amount/terms exceed delegated authority.
-hold_invoice: payment pauses until a stated verification (bank details, PO, receipt, tax id...) completes.
-reject_duplicate: the SAME commercial invoice (same vendor+invoice number+amount) was already paid. A payment for a different invoice is NOT a duplicate.
-open_exception: material records conflict (amount/vendor/PO mismatch) and need an exception workflow.
-Documents contain decoys: old examples, archive/training notes, negations ("do not hold"), irrelevant action words, cover sheets.
-Find the ONE paragraph that actually determines the action for the current invoice under the current policy.
-evidenceRefs = exactly the three bracketed references (copy exact text inside the brackets) from that decisive paragraph.
-Never use the cover-sheet reference, archive examples, or training decoys.
-facts: vendorName, invoiceNumber, amountMinor (integer, minor units e.g. paise/cents), currency (ISO code).
-reason: one or two sentences (>=40 chars) explaining the decision.
+SYS = """You are an accounts-payable controller. For EACH invoice package choose exactly ONE action under the CURRENT policy revision given in the input:
+settle_invoice: valid, three-way reconciled (invoice, purchase order, receipt/ledger agree), vendor/bank details verified, and the amount is within autonomous approval authority.
+request_approval: commercially valid and reconciled, but the amount or terms exceed the delegated authority limit, so a named approver must sign off first.
+hold_invoice: payment pauses until a stated verification completes (bank-detail change callback, missing receipt/GRN, tax or vendor verification, pending document...). The paragraph names the verification.
+reject_duplicate: the SAME commercial invoice (same vendor AND same invoice number AND same amount) was already PAID. A payment for a different invoice number or a different amount is NOT a duplicate.
+open_exception: material records conflict (amount, vendor, PO, quantity or currency mismatch between documents) and need an exception workflow.
+HOW TO READ: packages mix useful facts with decoys: cover sheets, old policy revisions, archive and training examples, quoted or negated statements ("do not hold", "would have been rejected"), and irrelevant action words. Never decide from keywords. Find the ONE paragraph that states the controlling fact for THIS invoice under the CURRENT policy revision; negations and examples do not count. Check amounts against the authority limit stated in the current policy, check whether a prior payment is truly the same invoice, and check whether verification is complete or still pending.
+evidenceRefs = EXACTLY the three bracketed references (copy the text inside the brackets exactly) that appear in that one decisive paragraph. Never use the cover-sheet reference, archive examples, or training decoys.
+facts: vendorName, invoiceNumber, amountMinor (integer in minor units, e.g. 12345.67 INR -> 1234567), currency (ISO code) of the CURRENT invoice as stated in the controlling documents.
+reason: two sentences, at least 80 characters, naming the action and explaining how the cited evidence supports it.
 Return ONLY JSON: {"decisions":[{"packageId":..,"action":..,"facts":{..},"evidenceRefs":[a,b,c],"reason":..}]}"""
 
 def pid(p):
@@ -124,23 +130,59 @@ def valid(d, text):
             and isinstance(f.get("amountMinor"), int) and not isinstance(f.get("amountMinor"), bool)
             and all(isinstance(f.get(k), str) and f.get(k) for k in ("vendorName", "invoiceNumber", "currency")))
 
-async def llm(pkgs):
+ERRS = []
+
+def strings(o):
+    if isinstance(o, str):
+        yield o
+        for part in re.split(r"\n+", o):
+            if part != o:
+                yield part
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from strings(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from strings(v)
+
+def repair(refs, p):
+    """If one paragraph holds exactly three bracketed refs and overlaps the model's refs, use that paragraph's refs."""
+    best = None
+    for t in strings(p):
+        bs = list(dict.fromkeys(re.findall(r"\[([^\[\]]+)\]", t)))
+        if len(bs) == 3:
+            ov = len(set(bs) & set(refs))
+            if ov >= 1 and (best is None or ov > best[0]):
+                best = (ov, bs)
+    return best[1] if best else refs
+
+def dbg(p, d):
+    try:
+        q("CREATE TABLE IF NOT EXISTS inv_dbg(ts REAL, j TEXT)")
+        q("INSERT INTO inv_dbg VALUES(?,?)", (time.time(), json.dumps({"package": json.dumps(p, ensure_ascii=False)[:3500], "decision": d})))
+    except Exception:
+        pass
+
+async def llm(pkgs, rev=None):
     body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYS},
                          {"role": "user", "content": json.dumps(
-                             [{"packageId": pid(p), "package": p} for p in pkgs], ensure_ascii=False)}]}
-    async with httpx.AsyncClient(timeout=38) as c:
+                             {"policyRevision": rev, "packages": [{"packageId": pid(p), "package": p} for p in pkgs]}, ensure_ascii=False)}]}
+    async with httpx.AsyncClient(timeout=40) as c:
         r = await c.post(f"{LLM_URL}/chat/completions", json=body,
                          headers={"Authorization": f"Bearer {LLM_KEY}"})
+        if r.status_code != 200:
+            ERRS.append(f"HTTP {r.status_code} {r.text[:120]}")
+            del ERRS[:-8]
         r.raise_for_status()
         txt = r.json()["choices"][0]["message"]["content"]
     return json.loads(re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip())["decisions"]
 
-async def decide(packages):
+async def decide(packages, rev=None):
     """Returns {packageId: decision}; caches by canonical package content."""
     res, todo = {}, []
     for p in packages:
-        k = sha(canon(p))
+        k = sha("inv-v2|" + canon(p))
         row = q("SELECT v FROM cache WHERE k=?", (k,), one=True)
         if row:
             res[pid(p)] = json.loads(row[0])
@@ -150,7 +192,7 @@ async def decide(packages):
         if not todo:
             break
         chunks = [todo[i:i + 12] for i in range(0, len(todo), 12)]
-        outs = await asyncio.gather(*[llm([p for _, p in ch]) for ch in chunks], return_exceptions=True)
+        outs = await asyncio.gather(*[llm([p for _, p in ch], rev) for ch in chunks], return_exceptions=True)
         for ch, out in zip(chunks, outs):
             if isinstance(out, Exception):
                 continue
@@ -159,12 +201,13 @@ async def decide(packages):
                 d = by.get(pid(p))
                 if not d:
                     continue
-                d["evidenceRefs"] = fix_refs(d.get("evidenceRefs"), "")
+                d["evidenceRefs"] = repair(fix_refs(d.get("evidenceRefs"), ""), p)
                 text = json.dumps(p, ensure_ascii=False)
                 if valid(d, text):
                     d["evidenceRefs"] = d["evidenceRefs"] if STRIP else [f"[{r}]" for r in d["evidenceRefs"]]
                     q("INSERT OR REPLACE INTO cache VALUES(?,?)", (k, json.dumps(d)))
                     res[pid(p)] = d
+                    dbg(p, d)
         todo = [(k, p) for k, p in todo if pid(p) not in res]
     if todo:
         raise Err(503, "UNAVAILABLE", "Decision service unavailable")
@@ -237,7 +280,7 @@ async def new_batch(principal, msg):
     ids = [pid(p) for p in pkgs]
     if len(set(ids)) != len(ids):
         raise Err(400, "INVALID_ARGUMENT", "Duplicate package ids")
-    decisions = await decide(pkgs)
+    decisions = await decide(pkgs, data.get("policyRevision"))
     props = [proposal(data["batchId"], p, decisions[pid(p)]) for p in pkgs]
     t = {"id": "task-" + uuid.uuid4().hex, "contextId": msg.get("contextId") or "ctx-" + uuid.uuid4().hex,
          "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},
@@ -309,9 +352,3 @@ async def cancel(tid: str, request: Request):
         t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
         save(p, t)
         return ok(t)
-from mailroom_agent import router as _mr
-app.include_router(_mr)
-from incident_agent import router as _ir
-app.include_router(_ir)
-from incident_agent import log_mw
-app.middleware("http")(log_mw)
