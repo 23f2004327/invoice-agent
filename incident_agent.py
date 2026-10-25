@@ -84,8 +84,11 @@ async def call_llm(prompt, deadline):
         left = deadline - time.time()
         if left < 4.5:
             break
-        body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"}, "max_tokens": 1200,
+        body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+                "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "4096")),
                 "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": prompt}]}
+        if os.environ.get("LLM_REASONING"):
+            body["reasoning_effort"] = os.environ["LLM_REASONING"]
         try:
             async with httpx.AsyncClient(timeout=min(left - 0.5, 11.5)) as c:
                 r = await c.post(f"{LLM_URL}/chat/completions", json=body, headers={"Authorization": f"Bearer {LLM_KEY}"})
@@ -399,14 +402,14 @@ async def build_run(b, h, t_req, tp_h, ts_h):
     first = waiting(state, disp, [])
     save_state(state, h, first)
     try:
-        dbg = {"requestKeys": sorted(b), "incidentKeys": sorted(inc), "policyKeys": sorted(pol),
+        dbgd = {"requestKeys": sorted(b), "incidentKeys": sorted(inc), "policyKeys": sorted(pol),
                "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
                "allowedRootCauses": inc.get("allowedRootCauses"),
                "toolCatalog": [{"name": t.get("name"), "schema": t.get("inputSchema")} for t in b["toolCatalog"] if isinstance(t, dict)],
                "transcriptHead": inc["transcript"][:700], "transcriptLen": len(inc["transcript"]), "idsFound": len(ids),
                "idsSample": ids[:6], "llmError": LAST.get("err"), "rawPlan": rawplan,
                "modelSeconds": round((m1 - m0) / 1e9, 2), "promptChars": len(prompt), "full": first}
-        q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps(dbg)))
+        q("INSERT INTO inc_dbg VALUES(?,?)", (time.time(), json.dumps(dbgd)))
     except Exception:
         pass
     return first
