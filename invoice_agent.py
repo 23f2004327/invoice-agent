@@ -352,3 +352,11 @@ async def cancel(tid: str, request: Request):
         t["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": now()}
         save(p, t)
         return ok(t)
+from mailroom_agent import router as _mr
+app.include_router(_mr)
+
+from incident_agent import router as _ir
+app.include_router(_ir)
+
+from incident_agent import log_mw
+app.middleware("http")(log_mw)
